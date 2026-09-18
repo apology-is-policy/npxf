@@ -1,3 +1,4 @@
+#include "platform.hpp"
 // npxf-server -- the 9P2000.L operations.
 //
 // Every handler follows the same shape: decode the body, resolve fids, do the
@@ -14,9 +15,16 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/mount.h>
+#define st_atim st_atimespec
+#define st_mtim st_mtimespec
+#define st_ctim st_ctimespec
+#else
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#endif
 #include <sys/types.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -33,6 +41,7 @@ namespace {
 // These are ABI-stable numbers and structures the kernel exports but glibc
 // does not wrap; declaring them here keeps us on libc alone.
 
+#ifdef __linux__
 #ifndef SYS_openat2
 #define SYS_openat2 437
 #endif
@@ -55,7 +64,10 @@ constexpr uint64_t kResolveBeneath = 0x08;
 // (or seccomp policies) that do not offer it.
 std::atomic<bool> g_have_openat2{true};
 
+#endif
+
 int openat_beneath(int dirfd, const char *name, int flags) {
+#ifdef __linux__
     if (g_have_openat2.load(std::memory_order_relaxed)) {
         OpenHow how{};
         how.flags = uint64_t(unsigned(flags));
@@ -65,29 +77,13 @@ int openat_beneath(int dirfd, const char *name, int flags) {
         if (errno != ENOSYS && errno != EPERM) return -1;
         g_have_openat2.store(false, std::memory_order_relaxed);
     }
+#endif
+#ifdef __APPLE__
+    // O_SYMLINK opens the link itself; O_NOFOLLOW would reject it instead.
+    if (flags & O_SYMLINK) flags &= ~O_NOFOLLOW;
+#endif
     return ::openat(dirfd, name, flags);
 }
-
-// getdents64's record layout.  Declared with a one-element name rather than a
-// flexible array member so it stays valid C++; what matters is that d_name
-// lands at offset 19, exactly where the kernel puts it.
-struct Dirent64 {
-    uint64_t d_ino;
-    int64_t d_off;
-    uint16_t d_reclen;
-    uint8_t d_type;
-    char d_name[1];
-};
-static_assert(offsetof(Dirent64, d_ino) == 0, "getdents64 ABI");
-static_assert(offsetof(Dirent64, d_off) == 8, "getdents64 ABI");
-static_assert(offsetof(Dirent64, d_reclen) == 16, "getdents64 ABI");
-static_assert(offsetof(Dirent64, d_type) == 18, "getdents64 ABI");
-static_assert(offsetof(Dirent64, d_name) == 19, "getdents64 ABI");
-
-#ifndef F_OFD_GETLK
-#define F_OFD_GETLK 36
-#define F_OFD_SETLK 37
-#endif
 
 // ------------------------------------------------------------- /proc helper
 
@@ -100,6 +96,35 @@ std::string proc_path(int fd) {
     return buf;
 }
 
+ssize_t host_listxattr(int fd, const std::string &p, char *out, size_t n) {
+#ifdef __APPLE__
+    (void)p; return ::flistxattr(fd, out, n, 0);
+#else
+    (void)fd; return ::listxattr(p.c_str(), out, n);
+#endif
+}
+ssize_t host_getxattr(int fd, const std::string &p, const char *name, void *out, size_t n) {
+#ifdef __APPLE__
+    (void)p; return ::fgetxattr(fd, name, out, n, 0, 0);
+#else
+    (void)fd; return ::getxattr(p.c_str(), name, out, n);
+#endif
+}
+int host_setxattr(int fd, const std::string &p, const char *name, const void *in, size_t n, int flags) {
+#ifdef __APPLE__
+    (void)p; return ::fsetxattr(fd, name, in, n, 0, (flags & 1 ? XATTR_CREATE : 0) | (flags & 2 ? XATTR_REPLACE : 0));
+#else
+    (void)fd; return ::setxattr(p.c_str(), name, in, n, flags);
+#endif
+}
+int host_removexattr(int fd, const std::string &p, const char *name) {
+#ifdef __APPLE__
+    (void)p; return ::fremovexattr(fd, name, 0);
+#else
+    (void)fd; return ::removexattr(p.c_str(), name);
+#endif
+}
+
 // Best effort: an unprivileged server usually cannot hand a new file to an
 // arbitrary group, and failing the whole create over that would be unhelpful.
 void try_set_gid(int dirfd, const char *name, uint32_t gid) {
@@ -107,12 +132,15 @@ void try_set_gid(int dirfd, const char *name, uint32_t gid) {
         logf(2, "could not set gid %u on %s: %s", gid, name, std::strerror(errno));
 }
 
+#ifdef __linux__
 Fd reopen(int pfd, int flags) {
     std::string p = proc_path(pfd);
     int fd = ::open(p.c_str(), flags | O_CLOEXEC);
     if (fd < 0) oserr();
     return Fd(fd);
 }
+
+#endif
 
 // ----------------------------------------------------------------- qid glue
 
@@ -223,13 +251,13 @@ int translate_open_flags(uint32_t dotl, bool readonly) {
 
 Fd Conn::walk_one(int dirfd, const std::string &name) const {
     if (!valid_component(name)) oserr(EINVAL);
-    int fd = openat_beneath(dirfd, name.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    int fd = openat_beneath(dirfd, name.c_str(), platform::path_flags | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) oserr();
     return Fd(fd);
 }
 
 Fd Conn::resolve(const std::vector<std::string> &comps) const {
-    int fd = ::openat(rootfd_, ".", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int fd = ::openat(rootfd_, ".", platform::path_flags | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) oserr();
     Fd cur(fd);
     for (const auto &c : comps) cur = walk_one(cur.get(), c);
@@ -239,6 +267,27 @@ Fd Conn::resolve(const std::vector<std::string> &comps) const {
 Fd Conn::open_parent(const Fid &f) const {
     if (f.path.empty()) oserr(EINVAL);  // the export root has no parent we may name
     return resolve(std::vector<std::string>(f.path.begin(), f.path.end() - 1));
+}
+
+Fd Conn::reopen_fid(const Fid &f, int flags) const {
+#ifdef __linux__
+    return reopen(f.pfd.get(), flags);
+#else
+    // Darwin cannot upgrade an O_EVTONLY descriptor. Re-resolve under the
+    // pinned root, never follow a symlink, and reject a changed inode. In
+    // particular O_TRUNC must not run until identity has been checked.
+    auto before = fstat_or_throw(f.pfd.get());
+    if (!S_ISREG(before.st_mode) && !S_ISDIR(before.st_mode)) oserr(EOPNOTSUPP);
+    Fd parent = f.path.empty() ? resolve({}) : open_parent(f);
+    const char *name = f.path.empty() ? "." : f.path.back().c_str();
+    Fd fd(::openat(parent.get(), name, (flags & ~O_TRUNC) | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
+    if (!fd) oserr();
+    auto after = fstat_or_throw(fd.get());
+    if (before.st_dev != after.st_dev || before.st_ino != after.st_ino) oserr(ESTALE);
+    if (!S_ISREG(after.st_mode) && !S_ISDIR(after.st_mode)) oserr(EOPNOTSUPP);
+    if ((flags & O_TRUNC) && ::ftruncate(fd.get(), 0) != 0) oserr();
+    return fd;
+#endif
 }
 
 FidRef Conn::make_fid(Fd pfd, std::vector<std::string> path) const {
@@ -403,8 +452,13 @@ void Conn::op_statfs(uint16_t tag, Dec &d) {
     e.u64(uint64_t(sfs.f_bavail));
     e.u64(uint64_t(sfs.f_files));
     e.u64(uint64_t(sfs.f_ffree));
+#ifdef __APPLE__
+    e.u64(uint64_t(uint32_t(sfs.f_fsid.val[0])) | (uint64_t(uint32_t(sfs.f_fsid.val[1])) << 32));
+    e.u32(NAME_MAX);
+#else
     e.u64(uint64_t(uint32_t(sfs.f_fsid.__val[0])) | (uint64_t(uint32_t(sfs.f_fsid.__val[1])) << 32));
     e.u32(uint32_t(sfs.f_namelen));
+#endif
     send_reply(b);
 }
 
@@ -428,7 +482,7 @@ void Conn::op_lopen(uint16_t tag, Dec &d) {
         flags |= O_DIRECTORY;
     }
 
-    f->iofd = reopen(f->pfd.get(), flags);
+    f->iofd = reopen_fid(*f, flags);
     f->opened = true;
     f->dir_off = 0;
     logf(3, "[%s] opened %s flags=%#o", peer_.c_str(), f->display().c_str(), unsigned(flags));
@@ -582,11 +636,16 @@ void Conn::op_link(uint16_t tag, Dec &d) {
 
     // linkat(AT_EMPTY_PATH) needs CAP_DAC_READ_SEARCH; the /proc form is the
     // documented unprivileged equivalent.
+#ifdef __APPLE__
+    Fd parent = open_parent(*f);
+    int rc = ::linkat(parent.get(), f->path.back().c_str(), df->pfd.get(), name.c_str(), 0);
+#else
     int rc = ::linkat(f->pfd.get(), "", df->pfd.get(), name.c_str(), AT_EMPTY_PATH);
     if (rc != 0 && (errno == EPERM || errno == ENOENT || errno == EINVAL || errno == EACCES)) {
         std::string p = proc_path(f->pfd.get());
         rc = ::linkat(AT_FDCWD, p.c_str(), df->pfd.get(), name.c_str(), AT_SYMLINK_FOLLOW);
     }
+#endif
     if (rc != 0) oserr();
     send_empty(Rlink, tag);
 }
@@ -655,7 +714,7 @@ void Conn::op_unlinkat(uint16_t tag, Dec &d) {
 
     // Only AT_REMOVEDIR is meaningful here; ignore anything else a client
     // might set rather than passing unknown bits to the kernel.
-    int at = (flags & AT_REMOVEDIR) ? AT_REMOVEDIR : 0;
+    int at = (flags & 0x200u) ? AT_REMOVEDIR : 0;
     if (::unlinkat(f->pfd.get(), name.c_str(), at) != 0) oserr();
     send_empty(Runlinkat, tag);
 }
@@ -713,6 +772,12 @@ void Conn::op_getattr(uint16_t tag, Dec &d) {
     struct stat st;
     uint64_t btime_sec = 0, btime_nsec = 0;
 
+#ifdef __APPLE__
+    st = fstat_or_throw(f->pfd.get());
+    btime_sec = uint64_t(st.st_birthtimespec.tv_sec);
+    btime_nsec = uint64_t(st.st_birthtimespec.tv_nsec);
+    valid |= GETATTR_BTIME;
+#else
     struct statx stx;
     if (::statx(f->pfd.get(), "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
                 STATX_BASIC_STATS | STATX_BTIME, &stx) == 0) {
@@ -741,6 +806,8 @@ void Conn::op_getattr(uint16_t tag, Dec &d) {
     } else {
         st = fstat_or_throw(f->pfd.get());
     }
+
+#endif
 
     // We report exactly the fields we filled in.  GEN and DATA_VERSION stay
     // out of the mask rather than being faked, so a client can tell that we
@@ -794,16 +861,24 @@ void Conn::op_setattr(uint16_t tag, Dec &d) {
     if (valid & (SETATTR_UID | SETATTR_GID)) {
         uid_t u = (valid & SETATTR_UID) ? uid_t(uid) : uid_t(-1);
         gid_t g = (valid & SETATTR_GID) ? gid_t(gid) : gid_t(-1);
+#ifdef __APPLE__
+        if (::fchown(f->pfd.get(), u, g) != 0) oserr();
+#else
         if (::fchownat(f->pfd.get(), "", u, g, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0) oserr();
+#endif
     }
 
     if (valid & SETATTR_MODE) {
         if (f->is_symlink) oserr(EOPNOTSUPP);  // Linux has no lchmod
+#ifdef __APPLE__
+        if (::fchmod(f->pfd.get(), mode_t(mode & 07777)) != 0) oserr();
+#else
         long rc = ::syscall(SYS_fchmodat2, f->pfd.get(), "", mode_t(mode & 07777), AT_EMPTY_PATH);
         if (rc != 0) {
             std::string p = proc_path(f->pfd.get());
             if (::fchmodat(AT_FDCWD, p.c_str(), mode_t(mode & 07777), 0) != 0) oserr();
         }
+#endif
     }
 
     if (valid & SETATTR_SIZE) {
@@ -812,7 +887,7 @@ void Conn::op_setattr(uint16_t tag, Dec &d) {
         if (f->opened) {
             if (::ftruncate(f->iofd.get(), off_t(size)) != 0) oserr();
         } else {
-            Fd w = reopen(f->pfd.get(), O_WRONLY);
+            Fd w = reopen_fid(*f, O_WRONLY);
             if (::ftruncate(w.get(), off_t(size)) != 0) oserr();
         }
     }
@@ -847,8 +922,12 @@ void Conn::op_setattr(uint16_t tag, Dec &d) {
             Fd parent = open_parent(*f);
             rc = ::utimensat(parent.get(), f->path.back().c_str(), ts, AT_SYMLINK_NOFOLLOW);
         } else {
+#ifdef __APPLE__
+            rc = ::futimens(f->pfd.get(), ts);
+#else
             std::string p = proc_path(f->pfd.get());
             rc = ::utimensat(AT_FDCWD, p.c_str(), ts, 0);
+#endif
         }
         if (rc != 0) oserr();
     }
@@ -874,20 +953,20 @@ void Conn::op_xattrwalk(uint16_t tag, Dec &d) {
     ssize_t n;
     // An empty name asks for the list of attribute names instead of a value.
     if (name.empty()) {
-        n = ::listxattr(p.c_str(), nullptr, 0);
+        n = host_listxattr(f->pfd.get(), p, nullptr, 0);
         if (n < 0) oserr();
         buf.resize(size_t(n));
         if (n > 0) {
-            n = ::listxattr(p.c_str(), reinterpret_cast<char *>(buf.data()), buf.size());
+            n = host_listxattr(f->pfd.get(), p, reinterpret_cast<char *>(buf.data()), buf.size());
             if (n < 0) oserr();
             buf.resize(size_t(n));
         }
     } else {
-        n = ::getxattr(p.c_str(), name.c_str(), nullptr, 0);
+        n = host_getxattr(f->pfd.get(), p, name.c_str(), nullptr, 0);
         if (n < 0) oserr();
         buf.resize(size_t(n));
         if (n > 0) {
-            n = ::getxattr(p.c_str(), name.c_str(), buf.data(), buf.size());
+            n = host_getxattr(f->pfd.get(), p, name.c_str(), buf.data(), buf.size());
             if (n < 0) oserr();
             buf.resize(size_t(n));
         }
@@ -1041,63 +1120,45 @@ void Conn::op_readdir(uint16_t tag, Dec &d) {
 
     struct stat dst = fstat_or_throw(f->pfd.get());
 
-    if (int64_t(offset) != f->dir_off) {
-        if (::lseek(f->iofd.get(), off_t(offset), SEEK_SET) < 0) oserr();
-        f->dir_off = int64_t(offset);
-    }
-
     Bytes &b = reply_buf_;
     begin(b, Rreaddir, tag);
     Enc e(b);
-    e.u32(0);  // patched below
+    e.u32(0);
     const size_t body_start = b.size();
-
-    std::vector<char> dbuf(32768);
-    int64_t last_off = int64_t(offset);
+    if (!f->dir_stream) {
+        Fd scan = reopen_fid(*f, O_RDONLY | O_DIRECTORY);
+        DIR *dir = ::fdopendir(scan.get());
+        if (!dir) oserr();
+        scan.release();
+        f->dir_stream.reset(dir);
+    }
+    if (offset > uint64_t(LONG_MAX)) oserr(EINVAL);
+    DIR *dir = f->dir_stream.get();
+    if (!offset) ::rewinddir(dir);
+    else ::seekdir(dir, long(offset));
+    uint64_t last_off = offset;
     bool full = false;
-
-    while (!full) {
-        long n = ::syscall(SYS_getdents64, f->iofd.get(), dbuf.data(), dbuf.size());
-        if (n < 0) oserr();
-        if (n == 0) break;
-
-        size_t pos = 0;
-        while (pos < size_t(n)) {
-            auto *de = reinterpret_cast<Dirent64 *>(dbuf.data() + pos);
-            pos += de->d_reclen;
-            std::string_view name(de->d_name);
-
-            size_t need = readdir_entry_len(name.size());
-            if (b.size() - body_start + need > count) {
-                full = true;
-                break;
+    for (;;) {
+        errno = 0;
+        auto *de = ::readdir(dir);
+        if (!de) { if (errno) oserr(); break; }
+        std::string_view name(de->d_name);
+        if (b.size() - body_start + readdir_entry_len(name.size()) > count) { full = true; break; }
+        Qid q{};
+        q.path = qid_path(dst.st_dev, ino_t(de->d_ino));
+        uint8_t dtype = de->d_type;
+        q.type = qtype_of_dtype(dtype);
+        if (dtype == DT_UNKNOWN) {
+            struct stat es;
+            if (::fstatat(f->pfd.get(), de->d_name, &es, AT_SYMLINK_NOFOLLOW) == 0) {
+                q.type = qtype_of_mode(es.st_mode);
+                dtype = S_ISDIR(es.st_mode) ? DT_DIR : (S_ISLNK(es.st_mode) ? DT_LNK : DT_REG);
             }
-
-            Qid q;
-            q.path = qid_path(dst.st_dev, ino_t(de->d_ino));
-            q.version = 0;  // readdir qids are hints; the client getattrs anyway
-            uint8_t dtype = de->d_type;
-            if (dtype == DT_UNKNOWN) {
-                // Some filesystems do not fill d_type; pay for a stat there.
-                struct stat es;
-                if (::fstatat(f->iofd.get(), de->d_name, &es, AT_SYMLINK_NOFOLLOW) == 0) {
-                    q.type = qtype_of_mode(es.st_mode);
-                    dtype = S_ISDIR(es.st_mode) ? DT_DIR : (S_ISLNK(es.st_mode) ? DT_LNK : DT_REG);
-                } else {
-                    q.type = QTFILE;
-                }
-            } else {
-                q.type = qtype_of_dtype(dtype);
-            }
-
-            encode_dirent(e, q, uint64_t(de->d_off), dtype, name);
-            last_off = de->d_off;
         }
-        if (full) {
-            // Rewind to just past the last entry we actually emitted so the
-            // client's next Treaddir picks up exactly where this one stopped.
-            if (::lseek(f->iofd.get(), off_t(last_off), SEEK_SET) < 0) oserr();
-        }
+        long cookie = ::telldir(dir);
+        if (cookie < 0) oserr();
+        encode_dirent(e, q, uint64_t(cookie), dtype, name);
+        last_off = uint64_t(cookie);
     }
 
     // A caller whose count cannot hold even one entry would otherwise spin.
@@ -1119,7 +1180,12 @@ void Conn::op_fsync(uint16_t tag, Dec &d) {
         send_empty(Rfsync, tag);
         return;
     }
+#ifdef __APPLE__
+    (void)datasync;
+    int rc = ::fsync(f->iofd.get());
+#else
     int rc = datasync ? ::fdatasync(f->iofd.get()) : ::fsync(f->iofd.get());
+#endif
     if (rc != 0) oserr();
     send_empty(Rfsync, tag);
 }
@@ -1230,14 +1296,14 @@ void Conn::op_clunk(uint16_t tag, Dec &d) {
         std::string p = proc_path(f->pfd.get());
         int rc;
         if (f->xattr_size == 0) {
-            rc = ::removexattr(p.c_str(), f->xattr_name.c_str());
+            rc = host_removexattr(f->pfd.get(), p, f->xattr_name.c_str());
         } else {
             if (f->xattr_buf.size() != f->xattr_size) {
                 logf(1, "[%s] xattr %s: client wrote %zu of %llu bytes", peer_.c_str(),
                      f->xattr_name.c_str(), f->xattr_buf.size(),
                      static_cast<unsigned long long>(f->xattr_size));
             }
-            rc = ::setxattr(p.c_str(), f->xattr_name.c_str(), f->xattr_buf.data(),
+            rc = host_setxattr(f->pfd.get(), p, f->xattr_name.c_str(), f->xattr_buf.data(),
                             f->xattr_buf.size(), int(f->xattr_flags));
         }
         if (rc != 0) oserr();

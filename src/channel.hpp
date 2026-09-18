@@ -40,6 +40,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <mutex>
 #include <span>
 
@@ -81,6 +82,7 @@ crypto::Key derive_psk(std::span<const uint8_t> token);
 class Channel {
   public:
     Channel(int fd, SessionKeys &keys, size_t max_payload);
+    ~Channel();
     Channel(const Channel &) = delete;
     Channel &operator=(const Channel &) = delete;
 
@@ -95,6 +97,9 @@ class Channel {
     int fd() const { return fd_; }
 
   private:
+    friend struct ChannelTestAccess;
+    void poison();
+    std::atomic<bool> dead_{false};
     int fd_;
     crypto::Key ks_{}, kr_{};
     uint64_t nsend_ = 0, nrecv_ = 0;

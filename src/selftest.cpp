@@ -16,6 +16,14 @@
 #include "ninep.hpp"
 #include "util.hpp"
 
+namespace npxf {
+struct ChannelTestAccess {
+    static void exhaust(Channel &c, bool send) {
+        if (send) c.nsend_ = UINT64_MAX; else c.nrecv_ = UINT64_MAX;
+    }
+};
+}
+
 using namespace npxf;
 
 namespace {
@@ -305,13 +313,17 @@ bool channel_detects_tampering(std::string &detail) {
     net::write_full(q.a.get(), body.data(), body.size());
 
     bool threw = false;
-    try {
-        Bytes out;
-        (void)sc.recv(out);
-    } catch (const std::exception &) {
-        threw = true;
-    }
+    Bytes out(50, 0xCC);
+    try { (void)sc.recv(out); } catch (const std::exception &) { threw = true; }
     CHECK(threw);
+    CHECK(out.empty());
+    threw = false;
+    try { (void)sc.recv(out); } catch (const std::exception &) { threw = true; }
+    CHECK(threw); // immediate refusal, not a read waiting for another record
+    threw = false;
+    try { sc.send(msg); } catch (const std::exception &) { threw = true; }
+    CHECK(threw); // authentication failure is terminal in BOTH directions
+
     return true;
 }
 
@@ -389,6 +401,23 @@ bool channel_enforces_size_limit(std::string &detail) {
     return true;
 }
 
+bool channel_counter_exhaustion(std::string &detail) {
+    for (bool send : {false, true}) {
+        Pair p;
+        SessionKeys keys;
+        Channel channel(p.a.get(), keys, 1024);
+        ChannelTestAccess::exhaust(channel, send);
+        bool threw = false;
+        Bytes out;
+        try {
+            if (send) channel.send(out); else (void)channel.recv(out);
+        } catch (const std::exception &) { threw = true; }
+        CHECK(threw);
+        CHECK(out.empty());
+    }
+    return true;
+}
+
 void test_channel() {
     std::string d;
     report("channel handshake + record round-trip", channel_roundtrip(d), d);
@@ -400,6 +429,8 @@ void test_channel() {
     report("channel rejects replayed records", channel_rejects_replay(d), d);
     d.clear();
     report("channel enforces record size limits", channel_enforces_size_limit(d), d);
+    d.clear();
+    report("channel rejects exhausted counters", channel_counter_exhaustion(d), d);
 }
 
 }  // namespace

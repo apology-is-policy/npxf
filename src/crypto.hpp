@@ -1,21 +1,4 @@
-// npxf -- cryptographic primitives.
-//
-// Everything here is implemented from the RFCs because libc ships no crypto.
-// Each primitive has known-answer tests in selftest.cpp taken straight from
-// the relevant RFC; `crypto::self_test()` runs them and both binaries call it
-// at startup, so a miscompiled or mistranscribed primitive fails loudly rather
-// than silently producing a weak channel.
-//
-//   SHA-256                 FIPS 180-4
-//   HMAC-SHA256 / HKDF      RFC 2104 / RFC 5869
-//   ChaCha20                RFC 8439 sec. 2.4
-//   Poly1305                RFC 8439 sec. 2.5   (poly1305-donna 32-bit limbs)
-//   AEAD_CHACHA20_POLY1305  RFC 8439 sec. 2.8
-//   X25519                  RFC 7748            (TweetNaCl ladder)
-//
-// All secret-dependent code paths are branch- and index-free.  X25519 uses the
-// small-limb TweetNaCl ladder: it is slow (~1 ms) but short enough to read in
-// one sitting, and we run exactly one scalar multiplication per connection.
+// OpenSSL 3 provider-backed primitives; NPXF v1 wire format is unchanged.
 #pragma once
 
 #include <array>
@@ -23,6 +6,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <openssl/evp.h>
 
 namespace npxf::crypto {
 
@@ -38,7 +22,10 @@ using Hash = std::array<uint8_t, kHashLen>;
 
 class Sha256 {
   public:
-    Sha256() { reset(); }
+    Sha256();
+    ~Sha256();
+    Sha256(const Sha256 &) = delete;
+    Sha256 &operator=(const Sha256 &) = delete;
     void reset();
     void update(const uint8_t *p, size_t n);
     void update(std::span<const uint8_t> s) { update(s.data(), s.size()); }
@@ -47,12 +34,7 @@ class Sha256 {
     static Hash hash(std::span<const uint8_t> in);
 
   private:
-    void block(const uint8_t *p);
-
-    uint32_t h_[8];
-    uint64_t total_;
-    uint8_t buf_[64];
-    size_t buflen_;
+    EVP_MD_CTX *ctx_ = nullptr;
 };
 
 void hmac_sha256(std::span<const uint8_t> key, std::span<const uint8_t> msg, uint8_t out[kHashLen]);

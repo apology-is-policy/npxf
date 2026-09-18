@@ -2,8 +2,8 @@
 //
 // Security model for the file tree
 // --------------------------------
-// The export root is held open as an O_PATH descriptor for the process's
-// lifetime.  Every fid is likewise an O_PATH descriptor, and every walk step
+// The export root is held open as a path descriptor for the process's
+// lifetime. Every fid is likewise a descriptor, and every walk step
 // resolves exactly one path component relative to the fid it starts from,
 // using openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS) where the kernel
 // supports it and openat(O_PATH | O_NOFOLLOW) otherwise.  Because component
@@ -16,6 +16,10 @@
 // Symlinks are never followed.  9P2000.L expects the client to resolve them
 // via Treadlink, so a symlink fid refers to the link itself.  That also means
 // a symlink planted inside the export cannot be used to reach outside it.
+//
+// Darwin uses O_EVTONLY/O_SYMLINK handles and identity-checked reopening
+// beneath the root; a replaced inode fails ESTALE before O_TRUNC. Local
+// administrators must not move open export directories across the boundary.
 //
 // Credentials
 // -----------
@@ -39,6 +43,7 @@
 #include <vector>
 
 #include <sys/stat.h>
+#include <dirent.h>
 
 #include "channel.hpp"
 #include "ninep.hpp"
@@ -92,7 +97,8 @@ struct Fid {
     bool is_symlink = false;
     bool opened = false;
 
-    int64_t dir_off = 0;  // Treaddir cursor, in getdents64 offset units
+    int64_t dir_off = 0;  // Last returned opaque directory cookie.
+    std::unique_ptr<DIR, int (*)(DIR *)> dir_stream{nullptr, ::closedir};
 
     // Txattrwalk turns a fid into a read-only view of one xattr (or of the
     // name list); Txattrcreate turns it into a write buffer flushed on clunk.
@@ -157,7 +163,8 @@ class Conn {
     void send_reply(Bytes &b);
     void send_error(uint16_t tag, int e);
     void send_empty(uint8_t type, uint16_t tag);
-    void finish_tag(uint16_t tag);
+    void publish_reply(Bytes &b);
+    static thread_local bool worker_reply_;
 
     // ------ fid table
     FidRef get_fid(uint32_t id);
@@ -170,6 +177,7 @@ class Conn {
     Fd resolve(const std::vector<std::string> &comps) const;
     Fd walk_one(int dirfd, const std::string &name) const;
     Fd open_parent(const Fid &f) const;
+    Fd reopen_fid(const Fid &f, int flags) const;
     FidRef make_fid(Fd pfd, std::vector<std::string> path) const;
     void require_writable() const;
 

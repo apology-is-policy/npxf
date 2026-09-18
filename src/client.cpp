@@ -1,3 +1,4 @@
+#include "platform.hpp"
 #include "client.hpp"
 
 #include <algorithm>
@@ -237,7 +238,7 @@ Bytes Client::await(uint16_t tag, uint8_t expect) {
     Header h = parse(byte_span(msg));
     if (h.type == Rlerror) {
         Dec d(h.body);
-        int e = int(d.u32());
+        int e = platform::host_errno(int(d.u32()));
         throw RemoteError(e, std::strerror(e));
     }
     if (h.type != expect)

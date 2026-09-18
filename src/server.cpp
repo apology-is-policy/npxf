@@ -1,3 +1,4 @@
+#include "platform.hpp"
 // npxf-server -- main, listener, and the per-connection message loop.
 #include "server.hpp"
 
@@ -22,6 +23,7 @@
 namespace npxf::server {
 
 thread_local Bytes Conn::reply_buf_;
+thread_local bool Conn::worker_reply_ = false;
 
 namespace {
 
@@ -192,6 +194,11 @@ void Conn::worker_loop() {
 }
 
 void Conn::run_job(Job &job) {
+    struct ReplyGuard {
+        bool &active;
+        explicit ReplyGuard(bool &a) : active(a) { active = true; }
+        ~ReplyGuard() { active = false; }
+    } guard(worker_reply_);
     ninep::Dec d(std::span<const uint8_t>(job.msg).subspan(ninep::kHeaderLen));
     try {
         switch (job.type) {
@@ -232,19 +239,27 @@ void Conn::run_job(Job &job) {
         logf(1, "[%s] malformed %s: %s", peer_.c_str(), ninep::type_name(job.type), e.what());
         send_error(job.tag, EPROTO);
     }
-    finish_tag(job.tag);
+    if (worker_reply_) fail("operation completed without a reply");
 }
 
-void Conn::finish_tag(uint16_t tag) {
+void Conn::publish_reply(Bytes &b) {
+    if (!worker_reply_) { ch_->send(b); return; }
+    // The client may reuse its tag the instant it receives the reply. Hold
+    // admission's mutex across publication AND retirement, so its next request
+    // cannot observe a sent reply whose tag is still marked active. Lock order:
+    // tags_mu_ -> Channel send mutex; no channel path acquires tags_mu_.
     std::vector<uint16_t> flushes;
     {
         std::lock_guard<std::mutex> lk(tags_mu_);
+        ch_->send(b);
+        uint16_t tag = ld16(b.data() + 5);
         active_tags_.erase(tag);
         auto it = flush_waiters_.find(tag);
         if (it != flush_waiters_.end()) {
             flushes = std::move(it->second);
             flush_waiters_.erase(it);
         }
+        worker_reply_ = false;
     }
     tags_cv_.notify_all();
     for (uint16_t ft : flushes) send_empty(ninep::Rflush, ft);
@@ -258,29 +273,29 @@ void Conn::send_reply(Bytes &b) {
         logf(1, "[%s] reply of %zu bytes exceeds msize %u", peer_.c_str(), b.size(), msize);
         uint16_t tag = ld16(b.data() + 5);
         ninep::begin(b, ninep::Rlerror, tag);
-        ninep::Enc(b).u32(uint32_t(EMSGSIZE));
+        ninep::Enc(b).u32(uint32_t(platform::wire_errno(EMSGSIZE)));
         ninep::finish(b);
     }
     if (g_verbose >= 3)
         logf(3, "[%s] -> %s tag=%u len=%zu", peer_.c_str(), ninep::type_name(b[4]),
              ld16(b.data() + 5), b.size());
-    ch_->send(b);
+    publish_reply(b);
 }
 
 void Conn::send_error(uint16_t tag, int e) {
     Bytes b;
     ninep::begin(b, ninep::Rlerror, tag);
-    ninep::Enc(b).u32(uint32_t(e));
+    ninep::Enc(b).u32(uint32_t(platform::wire_errno(e)));
     ninep::finish(b);
     logf(2, "[%s] -> Rlerror tag=%u errno=%d (%s)", peer_.c_str(), tag, e, std::strerror(e));
-    ch_->send(b);
+    publish_reply(b);
 }
 
 void Conn::send_empty(uint8_t type, uint16_t tag) {
     Bytes b;
     ninep::begin(b, type, tag);
     ninep::finish(b);
-    ch_->send(b);
+    publish_reply(b);
 }
 
 // -------------------------------------------------------------- fid table
@@ -398,14 +413,16 @@ bool need_arg(int argc, char **argv, int &i, const char *what, std::string &out)
 
 int run(std::shared_ptr<const Config> cfgp) {
     const Config &cfg = *cfgp;
-    Fd rootfd(::open(cfg.root.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC));
+    Fd rootfd(::open(cfg.root.c_str(), platform::path_flags | O_DIRECTORY | O_CLOEXEC));
     if (!rootfd) throw_errno("open export root " + cfg.root);
 
     // Several operations reopen an O_PATH descriptor through /proc/self/fd,
     // which is the only race-free way to upgrade one.  Check now rather than
     // failing obscurely on the first setattr.
+#ifdef __linux__
     if (::access("/proc/self/fd", X_OK) != 0)
         fail("/proc is not mounted; npxf-server needs it to operate on open handles");
+#endif
 
     auto socks = net::tcp_listen(net::parse_addr(cfg.listen, "5640"), cfg.max_conns);
 
@@ -426,7 +443,7 @@ int run(std::shared_ptr<const Config> cfgp) {
         }
         for (auto &pf : pfds) {
             if (!(pf.revents & POLLIN)) continue;
-            Fd cs(::accept4(pf.fd, nullptr, nullptr, SOCK_CLOEXEC));
+            Fd cs(platform::accept_cloexec(pf.fd));
             if (!cs) {
                 if (errno == EINTR || errno == ECONNABORTED || errno == EAGAIN) continue;
                 throw_errno("accept");
@@ -551,7 +568,7 @@ int main(int argc, char **argv) {
         ::signal(SIGPIPE, SIG_IGN);
         struct sigaction sa {};
         sa.sa_handler = on_signal;  // deliberately no SA_RESTART, so poll() wakes
-        ::sigemptyset(&sa.sa_mask);
+        sigemptyset(&sa.sa_mask);
         ::sigaction(SIGINT, &sa, nullptr);
         ::sigaction(SIGTERM, &sa, nullptr);
 

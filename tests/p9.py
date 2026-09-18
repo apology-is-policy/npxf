@@ -6,6 +6,8 @@ the server is validated against something other than its own counterpart.
 Speaks plaintext 9P to `npxf tunnel`, exactly as the kernel's v9fs client does.
 """
 
+import errno as host_errno
+import sys
 import os
 import socket
 import struct
@@ -46,6 +48,13 @@ AT_REMOVEDIR = 0x200
 
 class Rlerror(Exception):
     def __init__(self, errno):
+        if sys.platform == "darwin":
+            errno = {11: host_errno.EAGAIN, 35: host_errno.EDEADLK,
+                     36: host_errno.ENAMETOOLONG, 37: host_errno.ENOLCK,
+                     38: host_errno.ENOSYS, 39: host_errno.ENOTEMPTY,
+                     40: host_errno.ELOOP, 61: host_errno.ENODATA,
+                     75: host_errno.EOVERFLOW, 95: host_errno.EOPNOTSUPP,
+                     116: host_errno.ESTALE}.get(errno, errno)
         super().__init__("Rlerror %d (%s)" % (errno, os.strerror(errno)))
         self.errno = errno
 

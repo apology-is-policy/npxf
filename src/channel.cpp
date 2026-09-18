@@ -1,3 +1,4 @@
+#include <sys/socket.h>
 #include "channel.hpp"
 
 #include <cstring>
@@ -9,6 +10,11 @@ namespace {
 
 const char kMagic[4] = {'N', 'P', 'X', 'F'};
 constexpr size_t kRecordHdr = 4;
+
+struct Wipe {
+    void *data; size_t size;
+    ~Wipe() { crypto::secure_zero(data, size); }
+};
 
 struct Derived {
     crypto::Key c2s{}, s2c{}, cfm{};
@@ -32,10 +38,12 @@ void expand_label(const uint8_t prk[32], std::string_view label, const crypto::H
 // transcript hash, produce the three session keys.
 void derive(const crypto::Key &psk, const uint8_t sk[32], const uint8_t peer[32],
             const crypto::Hash &h2, Derived &out) {
-    uint8_t dh[32];
+    uint8_t dh[32]{};
+    Wipe wipe_dh{dh, sizeof dh};
     if (!crypto::x25519(sk, peer, dh)) fail("handshake: peer sent a small-order public key");
 
-    uint8_t prk[32];
+    uint8_t prk[32]{};
+    Wipe wipe_prk{prk, sizeof prk};
     crypto::hkdf_extract(std::span<const uint8_t>(psk.data(), psk.size()),
                          std::span<const uint8_t>(dh, sizeof dh), prk);
     expand_label(prk, "npxf c2s v1", h2, out.c2s);
@@ -76,9 +84,11 @@ crypto::Key derive_psk(std::span<const uint8_t> token) {
 
 void client_handshake(int fd, std::span<const uint8_t> token, SessionKeys &out) {
     crypto::Key psk = derive_psk(token);
+    Wipe wipe_psk{psk.data(), psk.size()};
     net::set_timeout(fd, kHandshakeTimeoutMs);
 
-    uint8_t ce_sk[32], ce_pk[32];
+    uint8_t ce_sk[32]{}, ce_pk[32];
+    Wipe wipe_ce{ce_sk, sizeof ce_sk};
     crypto::random_bytes(ce_sk, sizeof ce_sk);
     crypto::x25519_base(ce_sk, ce_pk);
 
@@ -122,6 +132,7 @@ void client_handshake(int fd, std::span<const uint8_t> token, SessionKeys &out) 
 
 void server_handshake(int fd, std::span<const uint8_t> token, SessionKeys &out) {
     crypto::Key psk = derive_psk(token);
+    Wipe wipe_psk{psk.data(), psk.size()};
     net::set_timeout(fd, kHandshakeTimeoutMs);
 
     uint8_t msg1[kHandshakeMsg1];
@@ -134,7 +145,8 @@ void server_handshake(int fd, std::span<const uint8_t> token, SessionKeys &out) 
     const uint8_t *ce_pk = msg1 + 8;
     crypto::Hash h1 = absorb(transcript_start(), msg1, sizeof msg1);
 
-    uint8_t se_sk[32], se_pk[32];
+    uint8_t se_sk[32]{}, se_pk[32];
+    Wipe wipe_se{se_sk, sizeof se_sk};
     crypto::random_bytes(se_sk, sizeof se_sk);
     crypto::x25519_base(se_sk, se_pk);
     crypto::Hash h2 = absorb(h1, se_pk, 32);
@@ -176,10 +188,21 @@ void make_nonce(uint64_t counter, uint8_t nonce[crypto::kNonceLen]) {
 
 }  // namespace
 
+Channel::~Channel() {
+    crypto::secure_zero(ks_.data(), ks_.size());
+    crypto::secure_zero(kr_.data(), kr_.size());
+}
+void Channel::poison() {
+    dead_.store(true, std::memory_order_release);
+    ::shutdown(fd_, SHUT_RDWR); // wake any peer send/recv blocked in the other direction
+}
+
 void Channel::send(const uint8_t *p, size_t n) {
     if (n > max_) fail("outgoing record of " + std::to_string(n) + " bytes exceeds the channel limit");
 
     std::lock_guard<std::mutex> lk(send_mu_);
+    try {
+    if (dead_.load(std::memory_order_acquire) || nsend_ == UINT64_MAX) fail("channel is closed or counter exhausted");
     sbuf_.resize(kRecordHdr + n + crypto::kTagLen);
     st32(sbuf_.data(), uint32_t(n + crypto::kTagLen));
 
@@ -190,10 +213,13 @@ void Channel::send(const uint8_t *p, size_t n) {
     nsend_++;
 
     net::write_full(fd_, sbuf_.data(), sbuf_.size());
+    } catch (...) { poison(); throw; }
 }
 
 bool Channel::recv(Bytes &out) {
     std::lock_guard<std::mutex> lk(recv_mu_);
+    try {
+    if (dead_.load(std::memory_order_acquire) || nrecv_ == UINT64_MAX) fail("channel is closed or counter exhausted");
 
     uint8_t hdr[kRecordHdr];
     if (!net::read_full(fd_, hdr, sizeof hdr)) return false;
@@ -215,6 +241,12 @@ bool Channel::recv(Bytes &out) {
         fail("record authentication failed -- the stream was tampered with or reordered");
     nrecv_++;
     return true;
+    } catch (...) {
+        crypto::secure_zero(out.data(), out.size());
+        out.clear();
+        poison();
+        throw;
+    }
 }
 
 }  // namespace npxf

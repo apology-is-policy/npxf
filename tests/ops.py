@@ -8,8 +8,10 @@ the server actually touched the filesystem, not just that it answered politely.
 """
 
 import errno
+import host_xattr  # supplies native Darwin checks where Python omits them
 import os
 import stat
+import struct
 import sys
 import time
 
@@ -70,6 +72,35 @@ def run(c, root):
     c.mkdir(root, scratch, 0o755)
     d = c.walk_to(root, scratch)
     base = os.path.join(EXPORT, scratch)
+
+    # A client can reuse a tag immediately after receiving its reply. This
+    # exposed a publication/retirement race under real concurrent transfers.
+    for _ in range(1000):
+        c.call("getattr", struct.pack("<IQ", d, p9.GETATTR_BASIC), tag=50000)
+    ok("a reply permits immediate reuse of its tag (1000 requests)")
+
+    # A Darwin fid cannot be upgraded through /proc/self/fd. Its safe reopen
+    # must reject a substituted inode BEFORE applying O_TRUNC. Linux may still
+    # open the pinned old inode; neither host may truncate the replacement.
+    stale_path = os.path.join(base, "stale.txt")
+    with open(stale_path, "wb") as out:
+        out.write(b"original")
+    stale = c.walk_to(d, "stale.txt")
+    os.rename(stale_path, stale_path + ".old")
+    with open(stale_path, "wb") as out:
+        out.write(b"replacement-must-survive")
+    try:
+        c.lopen(stale, p9.O_WRONLY | p9.O_TRUNC)
+        if sys.platform == "darwin":
+            bad("stale fid reopen", "accepted a replacement inode")
+    except p9.Rlerror as e:
+        if e.errno != errno.ESTALE:
+            raise
+    with open(stale_path, "rb") as inp:
+        check("stale fid never truncates a replacement", b"replacement-must-survive", inp.read())
+    c.clunk(stale)
+    os.unlink(stale_path)
+    os.unlink(stale_path + ".old")
 
     # ------------------------------------------------------------- setattr
     f = c.fid()
@@ -363,7 +394,7 @@ def run(c, root):
     expect_errno("creating over an existing name with O_EXCL fails", errno.EEXIST,
                  c.lcreate, c.walk_to(d, "."), "attr.txt",
                  p9.O_WRONLY | p9.O_CREAT | p9.O_EXCL, 0o644)
-    expect_errno("removing a non-empty directory without AT_REMOVEDIR fails", errno.EISDIR,
+    expect_errno("removing a non-empty directory without AT_REMOVEDIR fails", (errno.EPERM if sys.platform == "darwin" else errno.EISDIR),
                  c.unlinkat, d, "many", 0)
 
     c.clunk(md)

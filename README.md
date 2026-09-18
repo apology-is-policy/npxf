@@ -1,17 +1,38 @@
 # npxf
 
-A 9P2000.L server and client in C++20, over an authenticated and encrypted
-channel. No third-party libraries: libc, POSIX/Linux syscalls, and the C++
-standard library. Built with clang, lld and bash.
+A 9P2000.L server and client in C++20 for Linux and macOS. OpenSSL 3 supplies
+all cryptographic primitives and randomness. CMake builds both executables,
+runs tests through CTest and installs them with `cmake --install`.
 
-```
-./build.sh            # release into build/
-./build.sh test       # build and run the unit self-test
-./test.sh             # end-to-end suite against a real server
+npxf is an officially supported host-side server for Thylacine's Haul. The
+OpenSSL implementation preserves NPXF v1 wire compatibility with existing
+Haul clients. This is the NPXF authenticated record protocol, **not TLS**.
+
+## Build
+
+Requirements: a C++20 compiler, CMake 3.20+, OpenSSL 3 development files,
+and POSIX threads. Testing also requires Bash and Python 3.
+
+```sh
+# Debian/Ubuntu
+sudo apt install build-essential cmake libssl-dev python3
+
+# macOS (Apple Command Line Tools and Homebrew)
+brew install cmake openssl@3
+
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=RelWithDebInfo
+# If OpenSSL is not discovered on macOS, add:
+# -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+cmake --build build/release --parallel
+ctest --test-dir build/release --output-on-failure
+cmake --install build/release --prefix "$HOME/.local"
 ```
 
-`lld` is the intended linker; if it is not installed the build warns and falls
-back (`sudo apt install lld`).
+The executables are `build/release/npxf` and `build/release/npxf-server`.
+`./build.sh`, `./build.sh debug`, `./build.sh asan` and `./build.sh tsan` are
+convenience wrappers around the same CMake project. Select another compiler
+with CMake's `CMAKE_CXX_COMPILER`; sanitizers use `NPXF_SANITIZER=address`
+(ASan and UBSan) or `thread`. Use `BUILD_TESTING=OFF` to omit test dependencies.
 
 ## Quick start
 
@@ -30,11 +51,16 @@ $ npxf -a server.example:5640 put -r ./build build
 
 ## The secure channel
 
-`libc` ships no TLS, so the transport is built from primitives implemented here
-against their RFCs: X25519 (RFC 7748), ChaCha20-Poly1305 (RFC 8439), and
-SHA-256/HMAC/HKDF. Every one has known-answer tests from the defining RFC in
-`src/crypto_vectors.cpp`, and **both binaries run the full vector set at
-startup** and refuse to run if any of it fails.
+OpenSSL's EVP interfaces implement X25519, ChaCha20-Poly1305, SHA-256,
+HMAC and HKDF; `RAND_bytes_ex` supplies entropy, `CRYPTO_memcmp` compares tags,
+and `OPENSSL_cleanse` clears secret storage. No local implementations of those
+primitives remain. Known-answer tests in `src/crypto_vectors.cpp` still run
+at both binaries' startup, verifying the adapter's byte-level behavior.
+
+The protocol remains a custom, versioned PSK handshake for Haul compatibility.
+OpenSSL replacing the primitives does not make this TLS or constitute an
+independent review of the protocol. Use a randomly generated high-entropy token,
+not a human password; this is not a password-authenticated key exchange.
 
 The handshake is three flights, one round trip:
 
@@ -76,15 +102,10 @@ len[4] LE  |  ciphertext[len-16]  |  tag[16]
 
 AAD is the four length bytes. The nonce is `00000000 | LE64(counter)` with an
 independent counter per direction, so a nonce is never reused under a key and
-records cannot be reordered, dropped, duplicated or truncated without the tag
-failing. The self-test asserts each of those.
-
-**Caveat worth stating plainly:** this is hand-written cryptography. The
-primitives are standard, constant-time by construction, and verified against
-RFC vectors, and the handshake is a deliberately small Noise-style PSK pattern.
-It has not had third-party review. If you would rather not run hand-rolled
-crypto, run the server on localhost and put it behind an SSH tunnel instead —
-`npxf` will work fine over one.
+reordering, duplication and corruption are rejected. A missing intermediate
+record invalidates the next record. EOF at a record boundary does not authenticate
+that no final records were withheld; 9P callers still require complete replies.
+Counter exhaustion and any transport/authentication failure terminate the channel.
 
 ## The file server
 
@@ -92,12 +113,13 @@ crypto, run the server on localhost and put it behind an SSH tunnel instead —
 
 Containment is structural rather than checked:
 
-- The export root is an `O_PATH` descriptor held for the process's lifetime,
+- The export root is a descriptor held for the process's lifetime,
   and **every fid is a descriptor**, never a path string.
 - A walk resolves exactly one component at a time relative to the fid it starts
   from, via `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)` where available
   and `openat(O_PATH | O_NOFOLLOW)` otherwise. Names containing `/` are
-  rejected.
+  rejected. On macOS, `O_EVTONLY | O_SYMLINK | O_NONBLOCK` opens the
+  component itself, including a symlink, without following its target.
 - `..` never reaches the filesystem. The server pops a component from its own
   canonical list for the fid and clamps at the root, so the export behaves like
   a chroot from the client's point of view.
@@ -105,15 +127,23 @@ Containment is structural rather than checked:
   via `Treadlink`. A symlink planted in the export that points outside it is
   stored verbatim and is inert on the server side.
 
-Since there is no path string to smuggle a traversal through, and no gap
-between checking a name and opening it, the usual traversal and TOCTOU classes
-do not arise. `test.sh` covers `..` escapes, absolute paths, and outward-facing
+Single-component resolution and refusal to follow symlinks prevent clients
+from walking an absolute path or symlink target outside the exported tree. `test.sh` covers `..` escapes, absolute paths, and outward-facing
 symlinks.
 
-Some operations need a real descriptor where the fid only has an `O_PATH` one
-(read, write, chmod, truncate). Those go through `/proc/self/fd/N`, which is
-the race-free way to upgrade such a handle; the server checks `/proc` is
-mounted at startup rather than failing obscurely later.
+Linux upgrades its `O_PATH` handles through `/proc/self/fd/N`; `/proc` must
+be mounted. macOS uses descriptor-based metadata and extended-attribute APIs.
+For file I/O it re-walks beneath the pinned export root, refuses symlinks, and
+checks device/inode identity before truncating or using the reopened file.
+If an outside rename or replacement prevents that identity check, it returns
+`ESTALE` rather than opening the replacement. Darwin data I/O supports regular
+files and directories; special-file I/O is refused.
+
+Both platforms use open-file-description locks. Directory enumeration retains
+one libc directory stream per open fid and returns its opaque seek cookies.
+Native errno values and open/unlink/xattr flags are translated at the Linux
+9P2000.L wire boundary. A failed protocol test remains a failed suite on either
+platform; absent Python xattr bindings on macOS use native libc test calls.
 
 ### Credentials
 
@@ -177,7 +207,8 @@ Three things carry that:
   `pread`/`pwrite` carry their own offsets — so a pipelined copy runs genuinely
   in parallel; only operations that mutate fid state serialise.
 
-The remaining bottleneck at these rates is ChaCha20-Poly1305 in portable C.
+These historical measurements predate the OpenSSL migration; they are not
+benchmarks of the current build.
 
 Memory is roughly `max_conns × workers × msize` in the worst case, since each
 worker keeps a reply buffer; tune with `-c`, `-j` and `-m` if that matters.
@@ -206,7 +237,7 @@ mount needs root.
 
 | | |
 | --- | --- |
-| `src/crypto.{hpp,cpp}` | X25519, ChaCha20-Poly1305, SHA-256, HMAC, HKDF |
+| `src/crypto.{hpp,cpp}` | OpenSSL EVP adapters |
 | `src/crypto_vectors.cpp` | RFC known-answer tests, run at every startup |
 | `src/channel.{hpp,cpp}` | handshake and AEAD record layer |
 | `src/ninep.{hpp,cpp}` | 9P2000.L constants and codec |
@@ -221,7 +252,7 @@ mount needs root.
 
 ## Testing
 
-`./test.sh` runs 112 checks against a real server on loopback. Roughly:
+`./test.sh` runs protocol, CLI and concurrency checks against a real server on loopback. Roughly:
 
 - **Unit** — the RFC crypto vectors, codec round-trips and malformed-input
   rejection, and a live handshake over a socketpair that also asserts tampered,
@@ -239,7 +270,7 @@ mount needs root.
   and empty tokens, a garbage handshake, read-only enforcement, 600 malformed
   9P frames, and eight concurrent clients.
 
-It also passes clean under both sanitizers, including leak detection:
+Sanitizer builds use the same suites:
 
 ```console
 $ ./build.sh asan && NPXF_TEST_MODE=asan ./test.sh
@@ -251,14 +282,17 @@ depends on it.
 
 ## Known limits
 
-- **The crypto has not been independently reviewed.** See above.
+- **The NPXF handshake has not been independently reviewed.** Its primitives
+  now come from OpenSSL; see the protocol distinction above.
 - **Single-user export.** No per-request credential switching; every client
   with the token gets the server process's access.
 - If a process *outside* the server rearranges the exported tree mid-operation,
   a fid's cached path can go stale and an operation may land on the wrong file.
-  It cannot land outside the export — resolution always restarts from the root
-  descriptor — but the tree is assumed not to be moved under the server.
+  Existing directory descriptors remain capabilities to their original inodes,
+  even if a local process moves those directories outside the named root. The
+  host administrator must not rearrange the export across its boundary while
+  serving. A remotely supplied symlink is never followed by the server.
 - `Tflush` is answered correctly but does not abort a syscall already in
-  progress; each operation is a single syscall, so the wait is bounded.
+  progress; a filesystem syscall may itself block; no bounded cancellation is claimed.
 - `getattr` does not report `gen` or `data_version`; those bits are left out of
   the valid mask rather than being faked.

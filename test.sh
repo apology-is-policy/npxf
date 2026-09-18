@@ -6,11 +6,15 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 ROOT=$PWD
 MODE=${NPXF_TEST_MODE:-release}
+if ! command -v sha256sum >/dev/null; then
+    sha256sum() { shasum -a 256; }
+fi
 
 [[ ${1:-} == --build ]] && { ./build.sh "$MODE" || exit 1; }
 
-SERVER=$ROOT/build/$MODE/npxf-server
-CLIENT=$ROOT/build/$MODE/npxf
+BINDIR=${NPXF_TEST_BIN_DIR:-$ROOT/build/$MODE}
+SERVER=$BINDIR/npxf-server
+CLIENT=$BINDIR/npxf
 for b in "$SERVER" "$CLIENT"; do
     [[ -x $b ]] || {
         echo "missing $b -- run ./build.sh first" >&2
@@ -48,20 +52,27 @@ expect_fail() {
 run_p9_suite() {
     local script=$1 sock=$2
     local line
+    python3 "$script" "$sock" "$EXPORT" >"$TMP/protocol.log" 2>&1
+    local result=$?
     while IFS= read -r line; do
         case $line in
             "ok "*) ok "${line#ok }" ;;
             "FAIL "*) no "${line#FAIL }" ;;
             *) printf '        %s\n' "$line" ;;
         esac
-    done < <(python3 "$script" "$sock" "$EXPORT" 2>&1)
+    done < "$TMP/protocol.log"
+    if [[ $result != 0 ]]; then no "protocol suite exited with status $result"; fi
 }
 
 TMP=$(mktemp -d /tmp/npxf-test.XXXXXX)
 cleanup() {
     [[ -n $srv_pid ]] && kill "$srv_pid" 2>/dev/null
     wait 2>/dev/null
-    rm -rf "$TMP"
+    if [[ $fail -gt 0 || ${NPXF_KEEP_TEST:-0} == 1 ]]; then
+        echo "Test evidence retained: $TMP"
+    else
+        rm -rf "$TMP"
+    fi
 }
 trap cleanup EXIT
 
@@ -119,7 +130,7 @@ stop_server() {
 echo "npxf end-to-end tests ($MODE, port $PORT)"
 echo
 echo "-- unit --"
-"$ROOT/build/$MODE/npxf-selftest" | sed 's/^/  /' || fail=$((fail + 1))
+"$BINDIR/npxf-selftest" | sed 's/^/  /' || fail=$((fail + 1))
 
 echo
 echo "-- listing --"
@@ -313,7 +324,7 @@ s.close()
 PYEOF
 )
 check "an unmodified 9P client can talk through the tunnel" "hello from 9p" "$out"
-check "the tunnel socket is owner-only" "srw-------" "$(stat -c %A "$SOCK" 2>/dev/null)"
+check "the tunnel socket is owner-only" "srw-------" "$(python3 -c 'import os,stat,sys; print(stat.filemode(os.stat(sys.argv[1]).st_mode))' "$SOCK")"
 kill "$tun_pid" 2>/dev/null
 wait "$tun_pid" 2>/dev/null
 stop_server
@@ -408,7 +419,7 @@ rc=0
 pids=()
 for i in $(seq 1 8); do
     (
-        "${N[@]}" get big.bin "$WORK/par-$i.bin" >/dev/null 2>&1 || exit 1
+        "${N[@]}" get big.bin "$WORK/par-$i.bin" >"$TMP/client-$i.log" 2>&1 || exit 1
         cmp -s "$EXPORT/big.bin" "$WORK/par-$i.bin" || exit 1
     ) &
     pids+=($!)

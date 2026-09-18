@@ -1,0 +1,19 @@
+name: Build and test
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: macOS dependencies
+        if: runner.os == 'macOS'
+        run: echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+      - run: cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - run: cmake --build build/ci --parallel 4
+      - run: ctest --test-dir build/ci --output-on-failure

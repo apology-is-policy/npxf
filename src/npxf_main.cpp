@@ -1,3 +1,4 @@
+#include "platform.hpp"
 // npxf -- command line client.
 #include <algorithm>
 #include <cstdio>
@@ -388,7 +389,7 @@ void push_tree(Client &c, const Opts &o, const std::string &local, uint32_t dfid
 
 // ------------------------------------------------------------- commands
 
-int cmd_ls(Client &c, const Opts &o, std::vector<std::string> args) {
+int cmd_ls(Client &c, const Opts &, std::vector<std::string> args) {
     bool long_form = false;
     std::string path;
     for (auto &a : args) {
@@ -616,7 +617,7 @@ void remove_tree(Client &c, uint32_t dfid, const std::string &name) {
             for (const auto &de : c.readdir(scan)) remove_tree(c, fid, de.name);
         }
     }
-    c.unlinkat(dfid, name, is_dir ? uint32_t(AT_REMOVEDIR) : 0u);
+    c.unlinkat(dfid, name, is_dir ? 0x200u : 0u);
 }
 
 int cmd_rm(Client &c, const Opts &, std::vector<std::string> args) {
@@ -647,7 +648,7 @@ int cmd_rm(Client &c, const Opts &, std::vector<std::string> args) {
         is_dir = S_ISDIR(c.getattr(probe, GETATTR_MODE).mode);
     }
     if (is_dir && !recursive) {
-        c.unlinkat(dfid, name, uint32_t(AT_REMOVEDIR));  // succeeds only if empty
+        c.unlinkat(dfid, name, 0x200u);  // succeeds only if empty
         return 0;
     }
     if (is_dir)
@@ -803,7 +804,7 @@ int cmd_tunnel(const Opts &o, std::vector<std::string> args) {
         }
         for (auto &pf : pfds) {
             if (!(pf.revents & POLLIN)) continue;
-            Fd cs(::accept4(pf.fd, nullptr, nullptr, SOCK_CLOEXEC));
+            Fd cs(platform::accept_cloexec(pf.fd));
             if (!cs) continue;
             std::thread([sock = std::move(cs), opts = o]() mutable {
                 try {
