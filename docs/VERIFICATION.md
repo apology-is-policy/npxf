@@ -18,6 +18,9 @@ the NPXF v1 transcript and wire bytes. Relevant primary API references:
 - macOS with Homebrew LLVM, ASan + UBSan: both CTest targets pass.
 - Haul's existing Rust client: all 53 host tests, including the live encrypted
   handshake and Tversion/Rversion exchange against the macOS server, pass.
+- Real Thylacine guest, explicit CI profile: `haul-npxf` and `haul-post` pass
+  against the new macOS server (56 seconds each). These exercise private mounts,
+  same-shell service posting, remote reads, refusal paths and cleanup.
 
 The suite includes RFC crypto vectors, invalid tags and low-order keys, channel
 poisoning, exhausted counters, 1000 immediate reuses of one 9P tag, replacement

@@ -36,7 +36,9 @@
 //
 // AAD is the four length bytes.  The nonce is 00000000 | LE64(counter) with a
 // separate counter per direction, so a nonce is never reused under a key and
-// records cannot be reordered, dropped or replayed without the tag failing.
+// reordered or replayed records fail authentication. A missing intermediate
+// record invalidates the next record; EOF at a record boundary is not an
+// authenticated end-of-stream marker.
 #pragma once
 
 #include <cstddef>
