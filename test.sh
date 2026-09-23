@@ -48,6 +48,21 @@ expect_fail() {
     if "$@" >/dev/null 2>&1; then no "$name" "command unexpectedly succeeded"; else ok "$name"; fi
 }
 
+# log_has NAME REGEX -- the server log gains a line matching REGEX.  The server
+# writes it from the connection's own thread, possibly after the client that
+# caused it has exited, so this waits up to two seconds rather than racing it.
+log_has() {
+    local name=$1 re=$2
+    for _ in $(seq 1 40); do
+        if grep -qE -- "$re" "$TMP/server.log"; then
+            ok "$name"
+            return
+        fi
+        sleep 0.05
+    done
+    no "$name" "no line matching /$re/ in $TMP/server.log"
+}
+
 # Runs a python protocol suite and folds its ok/FAIL lines into our tally.
 run_p9_suite() {
     local script=$1 sock=$2
@@ -156,6 +171,15 @@ check "cat" "hello from 9p" "$("${N[@]}" cat hello.txt)"
 check "cat of an empty file" "" "$("${N[@]}" cat empty.txt)"
 check "df reports a block size" "1" "$("${N[@]}" df | grep -c '^block size : [0-9]')"
 
+# This server runs at the default verbosity: an operator must see each
+# connection's lifecycle without asking for -v.
+log_has "the default log shows a connection arriving" '^\[[^]]+\] connected$'
+log_has "the default log shows it authenticated" '^\[[^]]+\] authenticated$'
+log_has "the default log shows the attach and its aname" "^\\[[^]]+\\] attached as '[^']*', aname '[^']*'$"
+log_has "the default log shows it disconnecting" '^\[[^]]+\] disconnected$'
+check "the default log leaves per-request tracing to -v" "0" \
+    "$(grep -cE '^\[[^]]+\] (<-|->|opened) ' "$TMP/server.log")"
+
 echo
 echo "-- copy out --"
 "${N[@]}" get big.bin "$WORK/big.bin" >/dev/null
@@ -240,6 +264,8 @@ chmod 600 "$BAD"
 expect_fail "a wrong token is rejected" "$CLIENT" -a "$ADDR" -t "$BAD" ls
 expect_fail "an empty token is rejected" env NPXF_TOKEN= "$CLIENT" -a "$ADDR" ls
 check "the server survives a failed handshake" "hello from 9p" "$("${N[@]}" cat hello.txt)"
+log_has "the default log names a failed handshake" '^\[[^]]+\] handshake: '
+
 
 # A peer that speaks TCP but not npxf must be turned away, not hang the server.
 python3 - "$PORT" <<'EOF' >/dev/null 2>&1

@@ -48,9 +48,12 @@ void Conn::serve() {
     net::set_nodelay(sock_.get());
     net::set_keepalive(sock_.get());
 
+    // The lifecycle lines log at the default level: an operator whose mount
+    // misbehaves first needs to know whether a connection arrived at all.
+    logf(0, "[%s] connected", peer_.c_str());
     SessionKeys keys;
     server_handshake(sock_.get(), byte_span(cfg_->token), keys);
-    logf(1, "[%s] authenticated", peer_.c_str());
+    logf(0, "[%s] authenticated", peer_.c_str());
 
     ch_.emplace(sock_.get(), keys, cfg_->msize);
     msize_.store(cfg_->msize, std::memory_order_release);
@@ -139,7 +142,7 @@ void Conn::serve() {
         q_cv_.notify_one();
         msg = Bytes{};
     }
-    logf(1, "[%s] disconnected", peer_.c_str());
+    logf(0, "[%s] disconnected", peer_.c_str());
 }
 
 void Conn::start_workers() {
@@ -449,8 +452,8 @@ int run(std::shared_ptr<const Config> cfgp) {
                 throw_errno("accept");
             }
             if (g_live_conns.load() >= cfg.max_conns) {
-                logf(0, "npxf-server: refusing connection, at the %d connection limit",
-                     cfg.max_conns);
+                logf(0, "[%s] refused: at the %d connection limit",
+                     net::peer_name(cs.get()).c_str(), cfg.max_conns);
                 continue;  // cs closes here
             }
 

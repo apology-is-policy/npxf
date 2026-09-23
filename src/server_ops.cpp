@@ -353,7 +353,11 @@ void Conn::op_attach(uint16_t tag, Dec &d) {
     d.end();
 
     if (afid != kNoFid) oserr(EOPNOTSUPP);
-    if (!aname.empty() && aname != "/") oserr(ENOENT);
+    if (!aname.empty() && aname != "/") {
+        logf(0, "[%s] attach refused: aname '%s' is not served (only '/')", peer_.c_str(),
+             aname.c_str());
+        oserr(ENOENT);
+    }
 
     FidRef f = make_fid(resolve({}), {});
     struct stat st = fstat_or_throw(f->pfd.get());
@@ -363,7 +367,7 @@ void Conn::op_attach(uint16_t tag, Dec &d) {
     begin(b, Rattach, tag);
     Enc(b).qid(qid_of(st));
     send_reply(b);
-    logf(1, "[%s] attached as '%s'", peer_.c_str(), uname.c_str());
+    logf(0, "[%s] attached as '%s', aname '%s'", peer_.c_str(), uname.c_str(), aname.c_str());
 }
 
 void Conn::op_walk(uint16_t tag, Dec &d) {

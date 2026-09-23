@@ -154,6 +154,27 @@ holding the token has exactly the access the server process has, so run it as
 the user whose files you mean to share, and use `--read-only` when that is all
 you need.
 
+### Logging
+
+The server logs to stderr. With no `-v` it prints its startup line and one
+line per connection event, which is enough to tell whether a client reached
+it at all:
+
+```
+[192.0.2.7:51234] connected
+[192.0.2.7:51234] authenticated
+[192.0.2.7:51234] attached as '', aname '/'
+[192.0.2.7:51234] disconnected
+```
+
+A failed handshake names its cause (`[peer] handshake: client hung up before
+confirming (probably a token mismatch)`), as does a refused attach or a
+connection over the `--max-conns` limit. `-v` adds version negotiation and
+protocol anomalies (a malformed or unsupported message), `-v -v` worker counts
+and each error reply, and `-v -v -v` every message and every file opened. A permission problem the *client* decides locally -- a
+mount that enforces the modes the server reports -- never reaches this log;
+the default lines still show that the session itself was healthy.
+
 ### Implemented messages
 
 The full 9P2000.L set:
