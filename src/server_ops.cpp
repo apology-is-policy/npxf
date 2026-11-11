@@ -747,9 +747,12 @@ void Conn::op_readlink(uint16_t tag, Dec &d) {
 
     std::vector<char> buf(PATH_MAX);
     // An empty pathname makes readlinkat operate on the O_PATH|O_NOFOLLOW
-    // descriptor itself; older kernels want the parent-plus-name form.
+    // descriptor itself where the kernel allows that. Where it does not, the
+    // errno of the refusal is the kernel's choice (ENOENT or EINVAL on older
+    // Linux, ENOTDIR on macOS 27.2.1), so any failure tries the
+    // parent-plus-name form and that call's errno is the one reported.
     ssize_t n = ::readlinkat(f->pfd.get(), "", buf.data(), buf.size());
-    if (n < 0 && (errno == ENOENT || errno == EINVAL) && !f->path.empty()) {
+    if (n < 0 && !f->path.empty()) {
         Fd parent = open_parent(*f);
         n = ::readlinkat(parent.get(), f->path.back().c_str(), buf.data(), buf.size());
     }
